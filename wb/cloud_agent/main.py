@@ -45,7 +45,11 @@ def update_providers_list(_settings: AppSettings, mqtt):
     mqtt.publish_providers(",".join(get_providers()))
 
 
-def do_curl(settings: AppSettings, method="get", endpoint="", params=None):
+def do_curl(settings, method="get", endpoint="", params=None, initial_delay=5, backoff_factor=2, max_delay=30):
+    """
+    Execute a curl command with retry logic and logging.
+    Retries requests until successful, logging both errors and recovery.
+    """
     data_delimiter = "|||"
     output_format = data_delimiter + '{"code":"%{response_code}"}'
 
@@ -61,7 +65,6 @@ def do_curl(settings: AppSettings, method="get", endpoint="", params=None):
         raise ValueError("Invalid method: " + method)
 
     url = settings.CLOUD_AGENT_URL + endpoint
-
     command += [
         "--connect-timeout",
         "45",
@@ -83,24 +86,50 @@ def do_curl(settings: AppSettings, method="get", endpoint="", params=None):
         url,
     ]
 
-    result = subprocess.run(command, timeout=360, check=True, capture_output=True)
+    delay = initial_delay
+    connection_restored = False  # Tracks if connection recovery was logged
+    failure_count = 0  # Counts consecutive failures
 
-    decoded_result = result.stdout.decode("utf-8")
-    split_result = decoded_result.split(data_delimiter)
-    if len(split_result) != 2:
-        raise ValueError("Invalid data in response: " + str(split_result))
+    while True:
+        try:
+            result = subprocess.run(command, timeout=360, check=True, capture_output=True)
+            decoded_result = result.stdout.decode("utf-8")
+            split_result = decoded_result.split(data_delimiter)
+            if len(split_result) != 2:
+                raise ValueError("Invalid data in response: " + str(split_result))
 
-    try:
-        data = json.loads(split_result[0])
-    except JSONDecodeError:
-        data = {}
+            try:
+                data = json.loads(split_result[0])
+            except JSONDecodeError:
+                data = {}
 
-    try:
-        status = int(json.loads(split_result[1])["code"])
-    except (KeyError, TypeError, ValueError, JSONDecodeError) as e:
-        raise ValueError(f"Invalid data in response: {split_result}") from e
+            status = int(json.loads(split_result[1])["code"])
 
-    return data, status
+            # Log recovery only if there were previous failures
+            if failure_count > 0:
+                logging.info("Connection to %s restored.", url)
+
+            # Reset failure count and mark connection as restored
+            failure_count = 0
+            connection_restored = True
+
+            return data, status
+
+        except subprocess.CalledProcessError as e:
+            error_output = e.stderr.decode("utf-8", errors="ignore")
+            logging.error("Curl execution failed: %s", error_output)
+
+        except Exception as e:
+            logging.error("Unexpected error: %s", str(e))
+
+        # Increment failure count and log retry message
+        failure_count += 1
+        logging.info("Retrying in %d seconds...", delay)
+        time.sleep(delay)
+
+        # Update delay and reset connection restoration flag
+        delay = min(delay * backoff_factor, max_delay)
+        connection_restored = False
 
 
 def write_to_file(fpath: str, contents: str):
